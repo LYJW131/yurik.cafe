@@ -34,7 +34,8 @@ const { data } = entry;
 const { Content } = await render(entry);
 
 // 只有声明了 friends.show 的页面才抓订阅，其余页面不受影响
-const friends = data.friends?.show ? await getFriendsWithPosts(data.friends?.postCount ?? 3) : [];
+const friendPostCount = data.friends?.postCount ?? 3;
+const friends = data.friends?.show ? await getFriendsWithPosts(friendPostCount) : [];
 
 const isRoot = !data.path || data.path === '/';
 ---
@@ -68,9 +69,13 @@ const isRoot = !data.path || data.path === '/';
               {data.friends?.listTitle ?? 'Friends'}
             </h2>
 
-            <ul class="friend-grid">
+            <ul class="friend-grid" data-friend-limit={friendPostCount} data-friend-ref={site.url}>
               {friends.map((friend) => (
-                <li class="friend-card">
+                <li
+                  class="friend-card"
+                  data-friend-feed={friend.liveFeed}
+                  data-friend-link={friend.liveFeed ? friend.link : undefined}
+                >
                   <a
                     class="friend-avatar"
                     href={withRef(friend.link)}
@@ -163,6 +168,134 @@ const isRoot = !data.path || data.path === '/';
       </div>
     </div>
   </section>
+
+  {
+    friends.some((friend) => friend.liveFeed) ? (
+      <script>
+        import { extractFeedPosts, type FriendPost } from '../lib/feed-parser';
+
+        const FETCH_TIMEOUT = 6000;
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+
+        const appendRef = (href: string, ref: string): string => {
+          const base = ref.replace(/\/+$/, '');
+          if (!base || !/^https?:\/\//i.test(href) || /[?&]ref=/i.test(href)) return href;
+          try {
+            if (new URL(href).host === new URL(base).host) return href;
+          } catch {
+            // ignore invalid URL
+          }
+          const hashAt = href.indexOf('#');
+          const head = hashAt >= 0 ? href.slice(0, hashAt) : href;
+          const hash = hashAt >= 0 ? href.slice(hashAt) : '';
+          return `${head}${head.includes('?') ? '&' : '?'}ref=${base}${hash}`;
+        };
+
+        const stampScope = (el: Element, scopeAttr: string | undefined) => {
+          if (scopeAttr) el.setAttribute(scopeAttr, '');
+          return el;
+        };
+
+        const buildPostItem = (post: FriendPost, ref: string, scopeAttr: string | undefined) => {
+          const li = stampScope(document.createElement('li'), scopeAttr);
+          const a = stampScope(document.createElement('a'), scopeAttr) as HTMLAnchorElement;
+          a.href = appendRef(post.link, ref);
+          a.target = '_blank';
+          a.rel = 'noopener';
+          a.title = post.title;
+
+          const svg = stampScope(document.createElementNS(SVG_NS, 'svg'), scopeAttr);
+          svg.setAttribute('viewBox', '0 0 24 24');
+          svg.setAttribute('fill', 'none');
+          svg.setAttribute('stroke', 'currentColor');
+          svg.setAttribute('stroke-width', '2');
+          svg.setAttribute('stroke-linecap', 'round');
+          svg.setAttribute('stroke-linejoin', 'round');
+          svg.setAttribute('aria-hidden', 'true');
+
+          for (const d of [
+            'M3 4m0 2a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-14a2 2 0 0 1-2-2z',
+            'M7 8h10M7 12h10M7 16h10',
+          ]) {
+            const path = stampScope(document.createElementNS(SVG_NS, 'path'), scopeAttr);
+            path.setAttribute('d', d);
+            svg.append(path);
+          }
+
+          const span = stampScope(document.createElement('span'), scopeAttr);
+          span.textContent = post.title;
+
+          a.append(svg, span);
+          li.append(a);
+          return li;
+        };
+
+        const samePosts = (list: Element | null, next: FriendPost[], ref: string) => {
+          if (!list) return false;
+          const links = [...list.querySelectorAll<HTMLAnchorElement>('a')];
+          if (links.length !== next.length) return false;
+          return links.every(
+            (a, i) => a.title === next[i].title && a.getAttribute('href') === appendRef(next[i].link, ref)
+          );
+        };
+
+        const hydrateCard = async (card: HTMLElement, limit: number, ref: string) => {
+          if (card.dataset.feedHydrated === '1') return;
+          card.dataset.feedHydrated = '1';
+
+          const feedUrl = card.dataset.friendFeed;
+          const baseLink = card.dataset.friendLink;
+          if (!feedUrl || !baseLink) return;
+
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+          try {
+            const res = await fetch(feedUrl, { signal: controller.signal });
+            if (!res.ok) return;
+            const type = res.headers.get('content-type') ?? '';
+            if (/text\/html/i.test(type)) return;
+
+            const posts = extractFeedPosts(await res.text(), baseLink, limit);
+            if (!posts.length || !card.isConnected) return;
+
+            const body = card.querySelector('.friend-body');
+            if (!body) return;
+
+            const existing = body.querySelector('.friend-posts');
+            if (samePosts(existing, posts, ref)) return;
+
+            const scopeAttr = card.getAttributeNames().find((name) => name.startsWith('data-astro-cid-'));
+            const list = existing ?? stampScope(document.createElement('ul'), scopeAttr);
+            if (!existing) {
+              list.className = 'friend-posts';
+              body.append(list);
+            }
+            list.replaceChildren(...posts.map((post) => buildPostItem(post, ref, scopeAttr)));
+          } catch {
+            // 网络失败或跨域受限时静默保留构建期静态内容
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+
+        const hydrateFriends = () => {
+          const grid = document.querySelector<HTMLElement>('.friend-grid');
+          if (!grid) return;
+          const limit = Math.max(1, Number(grid.dataset.friendLimit) || 3);
+          const ref = grid.dataset.friendRef ?? '';
+          grid
+            .querySelectorAll<HTMLElement>('.friend-card[data-friend-feed]')
+            .forEach((card) => void hydrateCard(card, limit, ref));
+        };
+
+        hydrateFriends();
+        if (!document.documentElement.dataset.friendsHydrateBound) {
+          document.documentElement.dataset.friendsHydrateBound = '1';
+          document.addEventListener('astro:page-load', hydrateFriends);
+        }
+      </script>
+    ) : null
+  }
 </BaseLayout>
 
 <style>
